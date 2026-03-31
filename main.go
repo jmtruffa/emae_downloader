@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/extrame/xls"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // ---------------------------------------------------------------------------
@@ -199,14 +199,12 @@ func insertCopy(db *sql.DB, rows []EMAERow, truncate bool) error {
 		}
 	}
 
-	stmt, err := tx.Prepare(`
-		COPY emae (fecha, emae, emae_var_anual, emae_desest,
-		           emae_desest_var_mensual, emae_tendencia_ciclo,
-		           emae_tendencia_ciclo_var_mensual)
-		FROM STDIN`)
+	stmt, err := tx.Prepare(pq.CopyIn("emae",
+		"fecha", "emae", "emae_var_anual", "emae_desest",
+		"emae_desest_var_mensual", "emae_tendencia_ciclo",
+		"emae_tendencia_ciclo_var_mensual"))
 	if err != nil {
-		// COPY via lib/pq is not supported with Prepare; fall back to row inserts
-		return insertRows(tx, rows)
+		return fmt.Errorf("prepare COPY: %w", err)
 	}
 	defer stmt.Close()
 
