@@ -94,6 +94,17 @@ func downloadFile(url, dest string) error {
 // XLS helpers
 // ---------------------------------------------------------------------------
 
+// safeRow wraps sheet.Row() with panic recovery — the extrame/xls library
+// can panic on certain rows with corrupted or missing data.
+func safeRow(sheet *xls.WorkSheet, idx int) (row *xls.Row) {
+	defer func() {
+		if r := recover(); r != nil {
+			row = nil
+		}
+	}()
+	return sheet.Row(idx)
+}
+
 func cellFloat(row *xls.Row, col int) *float64 {
 	if col >= int(row.LastCol()) {
 		return nil
@@ -141,7 +152,7 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 	var rows []EMAERow
 
 	for i := startRow; i <= int(sheet.MaxRow); i++ {
-		row := sheet.Row(i)
+		row := safeRow(sheet, i)
 		if row == nil {
 			currentDate = currentDate.AddDate(0, 1, 0)
 			continue
