@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/extrame/xls"
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 // ---------------------------------------------------------------------------
@@ -183,10 +183,10 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Database insert — COPY (bulk, truncates first)
+// Database insert — batch INSERT
 // ---------------------------------------------------------------------------
 
-func insertCopy(db *sql.DB, rows []EMAERow, truncate bool) error {
+func insertBatch(db *sql.DB, rows []EMAERow, truncate bool) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -199,42 +199,6 @@ func insertCopy(db *sql.DB, rows []EMAERow, truncate bool) error {
 		}
 	}
 
-	stmt, err := tx.Prepare(pq.CopyIn("emae",
-		"fecha", "emae", "emae_var_anual", "emae_desest",
-		"emae_desest_var_mensual", "emae_tendencia_ciclo",
-		"emae_tendencia_ciclo_var_mensual"))
-	if err != nil {
-		return fmt.Errorf("prepare COPY: %w", err)
-	}
-	defer stmt.Close()
-
-	for i, r := range rows {
-		_, err := stmt.Exec(
-			r.Fecha,
-			r.EMAE,
-			nullFloat(r.EMAEVarAnual),
-			nullFloat(r.EMAEDesest),
-			nullFloat(r.EMAEDesestVarMensual),
-			nullFloat(r.EMAETendenciaCiclo),
-			nullFloat(r.EMAETendenciaCicloVarMensual),
-		)
-		if err != nil {
-			return fmt.Errorf("row %d: %w", i, err)
-		}
-		if (i+1)%1000 == 0 {
-			fmt.Printf("  COPY progress: %d / %d\n", i+1, len(rows))
-		}
-	}
-
-	if _, err := stmt.Exec(); err != nil {
-		return fmt.Errorf("COPY finish: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// insertRows is used as fallback when COPY is not available.
-func insertRows(tx *sql.Tx, rows []EMAERow) error {
 	stmt, err := tx.Prepare(`
 		INSERT INTO emae (fecha, emae, emae_var_anual, emae_desest,
 		                  emae_desest_var_mensual, emae_tendencia_ciclo,
@@ -413,9 +377,9 @@ func main() {
 			log.Fatalf("UPSERT failed: %v", err)
 		}
 	} else {
-		fmt.Println("Insert mode: COPY")
-		if err := insertCopy(db, rows, *truncate); err != nil {
-			log.Fatalf("COPY failed: %v", err)
+		fmt.Println("Insert mode: INSERT")
+		if err := insertBatch(db, rows, *truncate); err != nil {
+			log.Fatalf("INSERT failed: %v", err)
 		}
 	}
 
