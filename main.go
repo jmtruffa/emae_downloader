@@ -42,14 +42,13 @@ func databaseURL() string {
 // Data types
 // ---------------------------------------------------------------------------
 
-// EMAERow represents one monthly observation of the EMAE indicator.
 type EMAERow struct {
-	Fecha                       time.Time
-	EMAE                        float64
-	EMAEVarAnual                *float64
-	EMAEDesest                  *float64
-	EMAEDesestVarMensual        *float64
-	EMAETendenciaCiclo          *float64
+	Fecha                        time.Time
+	EMAE                         float64
+	EMAEVarAnual                 *float64
+	EMAEDesest                   *float64
+	EMAEDesestVarMensual         *float64
+	EMAETendenciaCiclo           *float64
 	EMAETendenciaCicloVarMensual *float64
 }
 
@@ -139,29 +138,26 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 
 	fmt.Printf("Sheet: %q, rows: %d\n", sheet.Name, int(sheet.MaxRow)+1)
 
-	// The Python code skips 4 rows (skiprows=4) and reads columns C:H (indices 2-7).
-	// Row 0-3 are headers; data starts at row 4 (0-indexed).
-	// Dates are generated as monthly starting 2004-01-01.
 	const (
-		startRow = 4   // first data row (0-indexed, after skipping 4 header rows)
-		colEMAE  = 2   // column C
-		colH     = 7   // column H (last)
+		startRow = 4
+		colEMAE  = 2
+		colH     = 7
 	)
 
 	currentDate := time.Date(2004, 1, 1, 0, 0, 0, 0, time.UTC)
 	var rows []EMAERow
 
+	// Advance currentDate only after a row is successfully consumed. Header /
+	// blank rows between startRow and the first data row would otherwise shift
+	// the entire series forward by one month.
 	for i := startRow; i <= int(sheet.MaxRow); i++ {
 		row := safeRow(sheet, i)
 		if row == nil {
-			currentDate = currentDate.AddDate(0, 1, 0)
 			continue
 		}
 
-		// EMAE (column C) is required — skip row if missing
 		emaeVal := cellFloat(row, colEMAE)
 		if emaeVal == nil {
-			currentDate = currentDate.AddDate(0, 1, 0)
 			continue
 		}
 
@@ -172,7 +168,7 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 			EMAEDesest:                   cellFloat(row, colEMAE+2),
 			EMAEDesestVarMensual:         cellFloat(row, colEMAE+3),
 			EMAETendenciaCiclo:           cellFloat(row, colEMAE+4),
-			EMAETendenciaCicloVarMensual:  cellFloat(row, colH),
+			EMAETendenciaCicloVarMensual: cellFloat(row, colH),
 		}
 		rows = append(rows, r)
 		currentDate = currentDate.AddDate(0, 1, 0)
@@ -183,27 +179,40 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Database insert — batch INSERT
+// Database
 // ---------------------------------------------------------------------------
 
-func insertBatch(db *sql.DB, rows []EMAERow, truncate bool) error {
+// lastIngestedMaxFecha returns the max(fecha) across the rows belonging to the
+// most recent ingested_at snapshot. Returns zero time if the table is empty.
+func lastIngestedMaxFecha(db *sql.DB) (time.Time, error) {
+	var t sql.NullTime
+	err := db.QueryRow(`
+		SELECT MAX(fecha)
+		FROM emae
+		WHERE ingested_at = (SELECT MAX(ingested_at) FROM emae)`).Scan(&t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time, nil
+}
+
+func insertSnapshot(db *sql.DB, rows []EMAERow) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if truncate {
-		if _, err := tx.Exec("TRUNCATE TABLE emae RESTART IDENTITY"); err != nil {
-			return fmt.Errorf("truncate: %w", err)
-		}
-	}
+	ingestedAt := time.Now().UTC()
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO emae (fecha, emae, emae_var_anual, emae_desest,
 		                  emae_desest_var_mensual, emae_tendencia_ciclo,
-		                  emae_tendencia_ciclo_var_mensual)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`)
+		                  emae_tendencia_ciclo_var_mensual, ingested_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`)
 	if err != nil {
 		return err
 	}
@@ -218,6 +227,7 @@ func insertBatch(db *sql.DB, rows []EMAERow, truncate bool) error {
 			nullFloat(r.EMAEDesestVarMensual),
 			nullFloat(r.EMAETendenciaCiclo),
 			nullFloat(r.EMAETendenciaCicloVarMensual),
+			ingestedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("row %d: %w", i, err)
@@ -231,67 +241,10 @@ func insertBatch(db *sql.DB, rows []EMAERow, truncate bool) error {
 }
 
 // ---------------------------------------------------------------------------
-// Database insert — UPSERT
-// ---------------------------------------------------------------------------
-
-func insertUpsert(db *sql.DB, rows []EMAERow, truncate bool) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if truncate {
-		if _, err := tx.Exec("TRUNCATE TABLE emae RESTART IDENTITY"); err != nil {
-			return fmt.Errorf("truncate: %w", err)
-		}
-	}
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO emae (fecha, emae, emae_var_anual, emae_desest,
-		                  emae_desest_var_mensual, emae_tendencia_ciclo,
-		                  emae_tendencia_ciclo_var_mensual)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (fecha)
-		DO UPDATE SET
-			emae                             = EXCLUDED.emae,
-			emae_var_anual                   = EXCLUDED.emae_var_anual,
-			emae_desest                      = EXCLUDED.emae_desest,
-			emae_desest_var_mensual          = EXCLUDED.emae_desest_var_mensual,
-			emae_tendencia_ciclo             = EXCLUDED.emae_tendencia_ciclo,
-			emae_tendencia_ciclo_var_mensual = EXCLUDED.emae_tendencia_ciclo_var_mensual,
-			ingested_at                      = NOW()`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for i, r := range rows {
-		_, err := stmt.Exec(
-			r.Fecha,
-			r.EMAE,
-			nullFloat(r.EMAEVarAnual),
-			nullFloat(r.EMAEDesest),
-			nullFloat(r.EMAEDesestVarMensual),
-			nullFloat(r.EMAETendenciaCiclo),
-			nullFloat(r.EMAETendenciaCicloVarMensual),
-		)
-		if err != nil {
-			return fmt.Errorf("row %d: %w", i, err)
-		}
-		if (i+1)%1000 == 0 {
-			fmt.Printf("  UPSERT progress: %d / %d\n", i+1, len(rows))
-		}
-	}
-
-	return tx.Commit()
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-func nullFloat(v *float64) interface{} {
+func nullFloat(v *float64) any {
 	if v == nil {
 		return nil
 	}
@@ -317,8 +270,7 @@ func checkEnvVars() error {
 
 func main() {
 	filePath := flag.String("file", "", "Path to local XLS file (skips download)")
-	truncate := flag.Bool("truncate", false, "Truncate table before inserting")
-	upsert := flag.Bool("upsert", false, "Use UPSERT instead of COPY")
+	force := flag.Bool("force", false, "Insert snapshot even if max(fecha) did not advance")
 	flag.Parse()
 
 	if err := checkEnvVars(); err != nil {
@@ -327,7 +279,6 @@ func main() {
 
 	start := time.Now()
 
-	// --- Download or use local file ---
 	var xlsPath string
 	if *filePath != "" {
 		xlsPath = *filePath
@@ -345,7 +296,6 @@ func main() {
 		}
 	}
 
-	// --- Parse ---
 	rows, err := parseEMAE(xlsPath)
 	if err != nil {
 		log.Fatalf("Parse failed: %v", err)
@@ -355,11 +305,11 @@ func main() {
 		return
 	}
 
+	parsedMax := rows[len(rows)-1].Fecha
 	fmt.Printf("Date range: %s → %s\n",
 		rows[0].Fecha.Format("2006-01-02"),
-		rows[len(rows)-1].Fecha.Format("2006-01-02"))
+		parsedMax.Format("2006-01-02"))
 
-	// --- Database ---
 	db, err := sql.Open("postgres", databaseURL())
 	if err != nil {
 		log.Fatalf("DB open: %v", err)
@@ -371,16 +321,23 @@ func main() {
 	}
 	fmt.Println("Connected to PostgreSQL")
 
-	if *upsert {
-		fmt.Println("Insert mode: UPSERT")
-		if err := insertUpsert(db, rows, *truncate); err != nil {
-			log.Fatalf("UPSERT failed: %v", err)
+	lastMax, err := lastIngestedMaxFecha(db)
+	if err != nil {
+		log.Fatalf("Querying last snapshot: %v", err)
+	}
+
+	if !lastMax.IsZero() {
+		fmt.Printf("Last snapshot max(fecha): %s\n", lastMax.Format("2006-01-02"))
+		if !parsedMax.After(lastMax) && !*force {
+			fmt.Println("No new fecha vs last snapshot — skipping insert. Use -force to override.")
+			return
 		}
 	} else {
-		fmt.Println("Insert mode: INSERT")
-		if err := insertBatch(db, rows, *truncate); err != nil {
-			log.Fatalf("INSERT failed: %v", err)
-		}
+		fmt.Println("Table emae is empty — inserting initial snapshot.")
+	}
+
+	if err := insertSnapshot(db, rows); err != nil {
+		log.Fatalf("Insert failed: %v", err)
 	}
 
 	fmt.Printf("Done: %d rows inserted in %s\n", len(rows), time.Since(start).Round(time.Millisecond))
