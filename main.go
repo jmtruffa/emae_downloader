@@ -30,7 +30,8 @@ var (
 )
 
 const (
-	emaeURL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_base2004.xls"
+	emaeURL          = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_mensual_base2004.xls"
+	emaeActividadURL = "https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_actividad_base2004.xls"
 )
 
 func databaseURL() string {
@@ -50,6 +51,32 @@ type EMAERow struct {
 	EMAEDesestVarMensual         *float64
 	EMAETendenciaCiclo           *float64
 	EMAETendenciaCicloVarMensual *float64
+}
+
+type EMAEActividadRow struct {
+	Fecha   time.Time
+	Valores [emaeActividadSectorCount]*float64
+}
+
+const emaeActividadSectorCount = 16
+
+var emaeActividadColumns = [emaeActividadSectorCount]string{
+	"agricultura_ganaderia_caza_silvicultura",
+	"pesca",
+	"explotacion_minas_canteras",
+	"industria_manufacturera",
+	"electricidad_gas_agua",
+	"construccion",
+	"comercio_mayorista_minorista_reparaciones",
+	"hoteles_restaurantes",
+	"transporte_comunicaciones",
+	"intermediacion_financiera",
+	"actividades_inmobiliarias_empresariales_alquiler",
+	"administracion_publica_defensa_seguridad_social",
+	"ensenanza",
+	"servicios_sociales_salud",
+	"otras_actividades_servicios_comunitarios_sociales_personales",
+	"impuestos_netos_subsidios",
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +206,127 @@ func parseEMAE(filePath string) ([]EMAERow, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Parse EMAE activity sheets
+// ---------------------------------------------------------------------------
+
+func parseSpanishMonth(s string) (time.Month, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "enero":
+		return time.January, true
+	case "febrero":
+		return time.February, true
+	case "marzo":
+		return time.March, true
+	case "abril":
+		return time.April, true
+	case "mayo":
+		return time.May, true
+	case "junio":
+		return time.June, true
+	case "julio":
+		return time.July, true
+	case "agosto":
+		return time.August, true
+	case "septiembre":
+		return time.September, true
+	case "octubre":
+		return time.October, true
+	case "noviembre":
+		return time.November, true
+	case "diciembre":
+		return time.December, true
+	default:
+		return 0, false
+	}
+}
+
+func parseYearCell(s string) (int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	var year int
+	if _, err := fmt.Sscanf(s, "%d", &year); err != nil {
+		return 0, false
+	}
+	if year < 1900 || year > 2200 {
+		return 0, false
+	}
+	return year, true
+}
+
+func parseActividadSheet(sheet *xls.WorkSheet) (map[time.Time][emaeActividadSectorCount]*float64, []time.Time) {
+	values := map[time.Time][emaeActividadSectorCount]*float64{}
+	var order []time.Time
+	currentYear := 0
+
+	for i := 0; i <= int(sheet.MaxRow); i++ {
+		row := safeRow(sheet, i)
+		if row == nil {
+			continue
+		}
+
+		if year, ok := parseYearCell(row.Col(0)); ok {
+			currentYear = year
+		}
+
+		month, ok := parseSpanishMonth(row.Col(1))
+		if !ok || currentYear == 0 {
+			continue
+		}
+
+		var rowValues [emaeActividadSectorCount]*float64
+		hasValue := false
+		for c := 0; c < emaeActividadSectorCount; c++ {
+			v := cellFloat(row, c+2)
+			rowValues[c] = v
+			if v != nil {
+				hasValue = true
+			}
+		}
+		if !hasValue {
+			continue
+		}
+
+		fecha := time.Date(currentYear, month, 1, 0, 0, 0, 0, time.UTC)
+		if _, exists := values[fecha]; !exists {
+			order = append(order, fecha)
+		}
+		values[fecha] = rowValues
+	}
+
+	return values, order
+}
+
+func parseEMAEActividad(filePath string) ([]EMAEActividadRow, error) {
+	wb, err := xls.Open(filePath, "utf-8")
+	if err != nil {
+		return nil, fmt.Errorf("opening activity XLS: %w", err)
+	}
+
+	indicesSheet := wb.GetSheet(0)
+	if indicesSheet == nil {
+		return nil, fmt.Errorf("activity indices sheet 0 not found")
+	}
+
+	fmt.Printf("Activity sheet: %q, rows: %d\n", indicesSheet.Name, int(indicesSheet.MaxRow)+1)
+
+	indices, order := parseActividadSheet(indicesSheet)
+
+	rows := make([]EMAEActividadRow, 0, len(order))
+	for _, fecha := range order {
+		r := EMAEActividadRow{
+			Fecha:   fecha,
+			Valores: indices[fecha],
+		}
+		rows = append(rows, r)
+	}
+
+	fmt.Printf("Parsed %d EMAE activity observations\n", len(rows))
+	return rows, nil
+}
+
+// ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
@@ -240,6 +388,68 @@ func insertSnapshot(db *sql.DB, rows []EMAERow) error {
 	return tx.Commit()
 }
 
+// lastActividadIngestedMaxFecha returns the max(fecha) across the rows
+// belonging to the most recent emae_actividad snapshot.
+func lastActividadIngestedMaxFecha(db *sql.DB) (time.Time, error) {
+	var t sql.NullTime
+	err := db.QueryRow(`
+		SELECT MAX(fecha)
+		FROM emae_actividad
+		WHERE ingested_at = (SELECT MAX(ingested_at) FROM emae_actividad)`).Scan(&t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time, nil
+}
+
+func insertActividadSnapshot(db *sql.DB, rows []EMAEActividadRow) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	ingestedAt := time.Now().UTC()
+
+	columns := []string{"fecha"}
+	columns = append(columns, emaeActividadColumns[:]...)
+	columns = append(columns, "ingested_at")
+
+	placeholders := make([]string, len(columns))
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	stmt, err := tx.Prepare(fmt.Sprintf(`
+		INSERT INTO emae_actividad (%s)
+		VALUES (%s)`, strings.Join(columns, ", "), strings.Join(placeholders, ", ")))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for i, r := range rows {
+		args := make([]any, 0, len(columns))
+		args = append(args, r.Fecha)
+		for _, v := range r.Valores {
+			args = append(args, nullFloat(v))
+		}
+		args = append(args, ingestedAt)
+
+		if _, err := stmt.Exec(args...); err != nil {
+			return fmt.Errorf("activity row %d: %w", i, err)
+		}
+		if (i+1)%1000 == 0 {
+			fmt.Printf("  INSERT activity progress: %d / %d\n", i+1, len(rows))
+		}
+	}
+
+	return tx.Commit()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -270,6 +480,7 @@ func checkEnvVars() error {
 
 func main() {
 	filePath := flag.String("file", "", "Path to local XLS file (skips download)")
+	actividadFilePath := flag.String("actividad-file", "", "Path to local activity XLS file (skips activity download)")
 	force := flag.Bool("force", false, "Insert snapshot even if max(fecha) did not advance")
 	flag.Parse()
 
@@ -279,20 +490,31 @@ func main() {
 
 	start := time.Now()
 
+	tmp, err := os.MkdirTemp("", "emae_downloader_")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
 	var xlsPath string
 	if *filePath != "" {
 		xlsPath = *filePath
 		fmt.Printf("Using local file: %s\n", xlsPath)
 	} else {
-		tmp, err := os.MkdirTemp("", "emae_downloader_")
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer os.RemoveAll(tmp)
-
 		xlsPath = filepath.Join(tmp, "emae.xls")
 		if err := downloadFile(emaeURL, xlsPath); err != nil {
 			log.Fatalf("Download failed: %v", err)
+		}
+	}
+
+	var actividadXLSPath string
+	if *actividadFilePath != "" {
+		actividadXLSPath = *actividadFilePath
+		fmt.Printf("Using local activity file: %s\n", actividadXLSPath)
+	} else {
+		actividadXLSPath = filepath.Join(tmp, "emae_actividad.xls")
+		if err := downloadFile(emaeActividadURL, actividadXLSPath); err != nil {
+			log.Fatalf("Activity download failed: %v", err)
 		}
 	}
 
@@ -301,14 +523,26 @@ func main() {
 		log.Fatalf("Parse failed: %v", err)
 	}
 	if len(rows) == 0 {
-		fmt.Println("No rows parsed. Exiting.")
-		return
+		log.Fatal("No EMAE rows parsed.")
 	}
 
 	parsedMax := rows[len(rows)-1].Fecha
 	fmt.Printf("Date range: %s → %s\n",
 		rows[0].Fecha.Format("2006-01-02"),
 		parsedMax.Format("2006-01-02"))
+
+	actividadRows, err := parseEMAEActividad(actividadXLSPath)
+	if err != nil {
+		log.Fatalf("Activity parse failed: %v", err)
+	}
+	if len(actividadRows) == 0 {
+		log.Fatal("No EMAE activity rows parsed.")
+	}
+
+	actividadParsedMax := actividadRows[len(actividadRows)-1].Fecha
+	fmt.Printf("Activity date range: %s → %s\n",
+		actividadRows[0].Fecha.Format("2006-01-02"),
+		actividadParsedMax.Format("2006-01-02"))
 
 	db, err := sql.Open("postgres", databaseURL())
 	if err != nil {
@@ -330,15 +564,34 @@ func main() {
 		fmt.Printf("Last snapshot max(fecha): %s\n", lastMax.Format("2006-01-02"))
 		if !parsedMax.After(lastMax) && !*force {
 			fmt.Println("No new fecha vs last snapshot — skipping insert. Use -force to override.")
-			return
+		} else if err := insertSnapshot(db, rows); err != nil {
+			log.Fatalf("Insert failed: %v", err)
 		}
 	} else {
 		fmt.Println("Table emae is empty — inserting initial snapshot.")
+		if err := insertSnapshot(db, rows); err != nil {
+			log.Fatalf("Insert failed: %v", err)
+		}
 	}
 
-	if err := insertSnapshot(db, rows); err != nil {
-		log.Fatalf("Insert failed: %v", err)
+	actividadLastMax, err := lastActividadIngestedMaxFecha(db)
+	if err != nil {
+		log.Fatalf("Querying last activity snapshot: %v", err)
 	}
 
-	fmt.Printf("Done: %d rows inserted in %s\n", len(rows), time.Since(start).Round(time.Millisecond))
+	if !actividadLastMax.IsZero() {
+		fmt.Printf("Last activity snapshot max(fecha): %s\n", actividadLastMax.Format("2006-01-02"))
+		if !actividadParsedMax.After(actividadLastMax) && !*force {
+			fmt.Println("No new activity fecha vs last snapshot — skipping insert. Use -force to override.")
+		} else if err := insertActividadSnapshot(db, actividadRows); err != nil {
+			log.Fatalf("Activity insert failed: %v", err)
+		}
+	} else {
+		fmt.Println("Table emae_actividad is empty — inserting initial activity snapshot.")
+		if err := insertActividadSnapshot(db, actividadRows); err != nil {
+			log.Fatalf("Activity insert failed: %v", err)
+		}
+	}
+
+	fmt.Printf("Done in %s\n", time.Since(start).Round(time.Millisecond))
 }

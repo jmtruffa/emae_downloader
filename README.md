@@ -20,16 +20,22 @@ Descarga el Estimador Mensual de Actividad Economica (EMAE) publicado por [INDEC
 - **Frecuencia:** mensual, desde enero 2004
 - **Fecha:** primer dia del mes correspondiente
 
+Tambien descarga e ingesta el EMAE por sector de actividad:
+
+- **URL:** `https://www.indec.gob.ar/ftp/cuadros/economia/sh_emae_actividad_base2004.xls`
+- **Hoja 1:** indices base 2004 por sector
+- **Tabla destino:** `emae_actividad`
+
 ## Modelo
 
-Una unica tabla `emae` append-only. Cada corrida que aporta un mes nuevo
+Tablas `emae` y `emae_actividad` append-only. Cada corrida que aporta un mes nuevo
 inserta la serie completa con un `ingested_at` comun. Para revisiones de
 INDEC hacia atras: el supuesto es que solo tocan valores viejos cuando
 publican uno nuevo, por lo que basta con detectar el avance de `max(fecha)`
 para decidir si vale la pena guardar otro snapshot.
 
-La vista `emae_latest` resuelve "la serie ultima" (para cada `fecha`, la
-fila con el `ingested_at` mas alto).
+Las vistas `emae_latest` y `emae_actividad_latest` resuelven "la serie ultima"
+(para cada `fecha`, la fila con el `ingested_at` mas alto).
 
 ## Requisitos
 
@@ -96,11 +102,18 @@ fechas viejas sin avance del ultimo mes.
 ./emae_downloader -file /ruta/al/archivo.xls
 ```
 
+**Archivo local para actividad (sin descargar la segunda planilla):**
+
+```bash
+./emae_downloader -actividad-file /ruta/al/actividad.xls
+```
+
 ## Opciones
 
 | Flag | Default | Descripcion |
 |------|---------|-------------|
 | `-file` | *(descarga)* | Ruta a archivo XLS local |
+| `-actividad-file` | *(descarga)* | Ruta a archivo XLS local de actividad |
 | `-force` | `false` | Insertar snapshot aunque `max(fecha)` no avance |
 
 ## Esquema de datos
